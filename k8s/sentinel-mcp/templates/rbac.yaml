@@ -1,0 +1,33 @@
+{{- if .Values.serviceAccount.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "sentinel-mcp.fullname" . }}-role
+  labels:
+    app.kubernetes.io/name: {{ include "sentinel-mcp.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  # Least privilege: access to read pods, logs and update deployments
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "sentinel-mcp.fullname" . }}-rolebinding
+  labels:
+    app.kubernetes.io/name: {{ include "sentinel-mcp.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "sentinel-mcp.fullname" . }}-role
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

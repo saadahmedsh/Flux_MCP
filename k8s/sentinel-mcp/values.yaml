@@ -1,0 +1,22 @@
+replicaCount: 1
+
+image:
+  repository: your-registry/sentinel-mcp
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+serviceAccount:
+  create: true
+  name: "sentinel-mcp-sa"
+
+service:
+  type: ClusterIP
+  port: 8000
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi

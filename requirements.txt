@@ -1,0 +1,11 @@
+fastmcp
+mcp
+kubernetes
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation
+pytest
+pytest-asyncio
+ruff
+uvicorn
+starlette
