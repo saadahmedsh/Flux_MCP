@@ -2,9 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Install uv
+RUN pip install --no-cache-dir uv
+
 # Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
 
 # Copy application code
 COPY server.py .
@@ -16,4 +19,4 @@ RUN mkdir -p /var/log/sentinel
 EXPOSE 8000
 
 # Run the server
-CMD ["python", "server.py"]
+CMD ["uv", "run", "python", "server.py"]

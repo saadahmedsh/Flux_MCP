@@ -39,5 +39,6 @@ sequenceDiagram
 
 ## Setup
 
-1. Install dependencies: `pip install -r requirements.txt`
-2. Run server: `python server.py`
+1. Install dependencies: `make install`
+2. Run server: `make run`
+3. Run tests: `make test`
