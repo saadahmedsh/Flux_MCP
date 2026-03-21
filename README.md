@@ -39,6 +39,7 @@ sequenceDiagram
 
 ## Setup
 
-1. Install dependencies: `make install`
-2. Run server: `make run`
-3. Run tests: `make test`
+1. Install `uv` (see https://docs.astral.sh/uv/getting-started/installation/)
+2. Install dependencies: `make install`
+3. Run server: `make run`
+4. Run tests: `make test`
