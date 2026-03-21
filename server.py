@@ -151,11 +151,12 @@ async def apply_k8s_fix(namespace: str, deployment_name: str, action: str, conta
             return f"Failed to apply fix: {str(e)}"
 
 @mcp.tool()
-async def diagnose_cluster_health(ctx: Context) -> str:
+async def diagnose_cluster_health(ctx: Context, manual_testing: bool = False) -> str:
     """
     Autonomous Error Recovery Tool:
     Monitors for CrashLoopBackOff and uses sampling to request fixes from the LLM.
     The LLM is expected to run this tool periodically.
+    Set manual_testing to True when using the Inspector to bypass the LLM loop.
     """
     with tracer.start_as_current_span("diagnose_cluster_health") as span:
         logger.info("Running cluster health diagnostic")
@@ -170,7 +171,7 @@ async def diagnose_cluster_health(ctx: Context) -> str:
             for pod in pods.items:
                 if pod.status and pod.status.container_statuses:
                     for status in pod.status.container_statuses:
-                        if status.state and status.state.waiting and status.state.waiting.reason == "CrashLoopBackOff":
+                        if status.state and status.state.waiting and status.state.waiting.reason in ["CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull"]:
                             namespace = pod.metadata.namespace
                             pod_name = pod.metadata.name
                             issue = f"{namespace}/{pod_name}"
@@ -184,6 +185,10 @@ async def diagnose_cluster_health(ctx: Context) -> str:
 
                             # Fetch summarized logs via resource (simulated local call)
                             summary = await summarize_pod_logs(namespace, pod_name)
+                            
+                            if manual_testing:
+                                logger.info(f"Manual mode: Skipping LLM sampling for {issue}")
+                                continue
 
                             # Request diagnostic fix via sampling
                             try:
@@ -232,10 +237,17 @@ async def diagnose_cluster_health(ctx: Context) -> str:
 # Tool to read logs from restricted roots
 @mcp.tool()
 def read_sentinel_log(filepath: str) -> str:
-    """Read logs securely from the restricted /var/log/sentinel directory"""
+    """Read logs securely from the restricted sentinel log directory"""
     with tracer.start_as_current_span("read_sentinel_log") as span:
         span.set_attribute("filepath", filepath)
-        base_dir = Path("/var/log/sentinel")
+        
+        # Use a local cross-platform path for testing, or rely on ENV variable
+        log_dir = os.getenv("SENTINEL_LOG_DIR", "./sentinel_logs")
+        base_dir = Path(log_dir).resolve()
+        
+        # Ensure the directory actually exists for local testing
+        base_dir.mkdir(parents=True, exist_ok=True)
+        
         try:
             requested_path = Path(filepath).resolve()
         except Exception as e:
@@ -247,7 +259,7 @@ def read_sentinel_log(filepath: str) -> str:
             requested_path.relative_to(base_dir)
         except ValueError as e:
             span.record_exception(e)
-            return "Access denied: Can only read from /var/log/sentinel"
+            return f"Access denied: Can only read from {base_dir}"
 
         if not requested_path.exists():
             return f"File not found: {requested_path}"
@@ -267,4 +279,12 @@ if __name__ == "__main__":
     # or mount the FastMCP server in a custom FastAPI/Starlette application with auth middleware.
     # We are using the standard FastMCP runner here to avoid `sse_app()` method compatibility issues
     # reported by some MCP evaluation environments.
+    from mcp.server.transport_security import TransportSecuritySettings
+    mcp.settings.host = "0.0.0.0"
+    mcp.settings.port = 8000
+    # Disable DNS rebinding protection for local dev (allows Docker inspector to connect)
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    )
     mcp.run(transport="sse")
+
