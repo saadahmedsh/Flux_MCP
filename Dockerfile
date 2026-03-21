@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir uv
 
 # Install dependencies
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen
 
 # Copy application code
 COPY server.py .
