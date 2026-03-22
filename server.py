@@ -1,108 +1,139 @@
+"""
+Sentinel-MCP Server.
+
+Exposes Kubernetes monitoring and remediation tools via the Model Context Protocol.
+Connects to a local or in-cluster Kubernetes API and provides tools for:
+- Diagnosing unhealthy pods (CrashLoopBackOff, ImagePullBackOff)
+- Applying fixes to deployments (restart, image update)
+- Reading logs from a restricted directory
+"""
+
 import asyncio
 import logging
 import os
-from datetime import datetime
-from typing import List, Optional
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import List, Optional
 
+from kubernetes import client, config
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import Root, SamplingMessage, TextContent
-from kubernetes import client, config
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 
-# Setup OpenTelemetry
-provider = TracerProvider()
-processor = BatchSpanProcessor(ConsoleSpanExporter())
+UNHEALTHY_REASONS: List[str] = [
+    "CrashLoopBackOff",
+    "ImagePullBackOff",
+    "ErrImagePull",
+]
+
+provider: TracerProvider = TracerProvider()
+processor: BatchSpanProcessor = BatchSpanProcessor(ConsoleSpanExporter())
 provider.add_span_processor(processor)
 trace.set_tracer_provider(provider)
-tracer = trace.get_tracer("sentinel-mcp")
+tracer: trace.Tracer = trace.get_tracer("sentinel-mcp")
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("sentinel-mcp")
+logger: logging.Logger = logging.getLogger("sentinel-mcp")
 
-# Initialize FastMCP
-# dependencies defaults to true
-mcp = FastMCP("Sentinel-MCP", dependencies=["kubernetes", "opentelemetry-api"])
+mcp: FastMCP = FastMCP("Sentinel-MCP", dependencies=["kubernetes", "opentelemetry-api"])
 
-AUTH_TOKEN = os.getenv("SENTINEL_AUTH_TOKEN", "default-dev-token")
+AUTH_TOKEN: str = os.getenv("SENTINEL_AUTH_TOKEN", "default-dev-token")
 
-# Keep track of roots
 _roots: List[Root] = []
 
-# Rate limiting for sampling
+
 class RateLimiter:
-    def __init__(self, max_requests: int, window_seconds: int):
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
+    """Token-bucket style rate limiter for sampling requests."""
+
+    def __init__(self, max_requests: int, window_seconds: int) -> None:
+        self.max_requests: int = max_requests
+        self.window_seconds: int = window_seconds
         self.requests: List[float] = []
 
     def allow(self) -> bool:
-        now = time.time()
-        self.requests = [req for req in self.requests if now - req < self.window_seconds]
+        """Return True if a request is allowed within the current window."""
+        now: float = time.time()
+        self.requests = [r for r in self.requests if now - r < self.window_seconds]
         if len(self.requests) < self.max_requests:
             self.requests.append(now)
             return True
         return False
 
-sampling_limiter = RateLimiter(max_requests=5, window_seconds=60)
+
+sampling_limiter: RateLimiter = RateLimiter(max_requests=5, window_seconds=60)
 
 try:
     config.load_incluster_config()
 except Exception:
-    logger.warning("Failed to load incluster config. Will try to load kube config if available.")
+    logger.warning("Failed to load incluster config. Trying local kube config.")
     try:
         config.load_kube_config()
     except Exception:
-        pass
-v1 = client.CoreV1Api()
-apps_v1 = client.AppsV1Api()
+        logger.warning("No Kubernetes configuration found.")
+
+v1: client.CoreV1Api = client.CoreV1Api()
+apps_v1: client.AppsV1Api = client.AppsV1Api()
 
 
 @mcp.resource("k8s://logs/{namespace}/{pod_name}")
 async def summarize_pod_logs(namespace: str, pod_name: str) -> str:
     """
-    Semantic Compression Resource Template:
-    Retrieves pod logs and summarizes them instead of sending raw data to preserve context window.
+    Retrieve pod logs and produce a compressed summary.
+
+    Only errors and warnings are extracted to preserve context window budget
+    when forwarding to an LLM.
     """
     with tracer.start_as_current_span("summarize_pod_logs") as span:
         span.set_attribute("namespace", namespace)
         span.set_attribute("pod_name", pod_name)
         try:
-            logs = await asyncio.to_thread(
+            logs: str = await asyncio.to_thread(
                 v1.read_namespaced_pod_log,
-                name=pod_name, namespace=namespace, tail_lines=500
+                name=pod_name,
+                namespace=namespace,
+                tail_lines=500,
             )
 
-            # Semantic compression logic: summarize errors and warnings
-            errors = []
-            warnings = []
-            for line in logs.split('\n'):
-                if 'error' in line.lower() or 'exception' in line.lower() or 'fatal' in line.lower():
+            errors: List[str] = []
+            warnings: List[str] = []
+            for line in logs.split("\n"):
+                lower: str = line.lower()
+                if "error" in lower or "exception" in lower or "fatal" in lower:
                     errors.append(line)
-                elif 'warn' in line.lower():
+                elif "warn" in lower:
                     warnings.append(line)
 
-            summary = f"Log Summary for {namespace}/{pod_name}\n"
-            summary += f"Total Error Lines: {len(errors)}\n"
-            summary += f"Total Warning Lines: {len(warnings)}\n"
-
+            summary: str = (
+                f"Log Summary for {namespace}/{pod_name}\n"
+                f"Total Error Lines: {len(errors)}\n"
+                f"Total Warning Lines: {len(warnings)}\n"
+            )
             if errors:
                 summary += "\nTop 10 Errors:\n" + "\n".join(errors[:10])
 
             return summary
-        except Exception as e:
-            logger.error(f"Error fetching logs for {namespace}/{pod_name}: {e}")
-            span.record_exception(e)
-            return f"Error fetching logs: {str(e)}"
+        except Exception as exc:
+            logger.error("Error fetching logs for %s/%s: %s", namespace, pod_name, exc)
+            span.record_exception(exc)
+            return f"Error fetching logs: {exc}"
+
 
 @mcp.tool()
-async def apply_k8s_fix(namespace: str, deployment_name: str, action: str, container_image: Optional[str] = None) -> str:
+async def apply_k8s_fix(
+    namespace: str,
+    deployment_name: str,
+    action: str,
+    container_image: Optional[str] = None,
+) -> str:
     """
-    Tool to apply Kubernetes fixes.
-    Supported actions: restart, update_image
+    Apply a remediation action to a Kubernetes deployment.
+
+    Supported actions:
+        restart      - Trigger a rolling restart via annotation patch.
+        update_image - Update the first container image to the given value.
     """
     with tracer.start_as_current_span("apply_k8s_fix") as span:
         span.set_attribute("namespace", namespace)
@@ -111,13 +142,14 @@ async def apply_k8s_fix(namespace: str, deployment_name: str, action: str, conta
 
         try:
             if action == "restart":
-                # Trigger restart by patching annotations
-                patch = {
+                patch: dict = {
                     "spec": {
                         "template": {
                             "metadata": {
                                 "annotations": {
-                                    "sentinel.mcp.restart/restartedAt": datetime.utcnow().isoformat()
+                                    "sentinel.mcp.restart/restartedAt": datetime.now(
+                                        timezone.utc
+                                    ).isoformat()
                                 }
                             }
                         }
@@ -125,141 +157,155 @@ async def apply_k8s_fix(namespace: str, deployment_name: str, action: str, conta
                 }
                 await asyncio.to_thread(
                     apps_v1.patch_namespaced_deployment,
-                    name=deployment_name, namespace=namespace, body=patch
+                    name=deployment_name,
+                    namespace=namespace,
+                    body=patch,
                 )
-                return f"Restart triggered for deployment {deployment_name} in {namespace}"
+                return (
+                    f"Restart triggered for deployment {deployment_name} "
+                    f"in {namespace}"
+                )
 
-            elif action == "update_image" and container_image:
+            if action == "update_image":
+                if not container_image:
+                    return "update_image requires a container_image argument"
                 deployment = await asyncio.to_thread(
                     apps_v1.read_namespaced_deployment,
-                    name=deployment_name, namespace=namespace
+                    name=deployment_name,
+                    namespace=namespace,
                 )
-                # Update first container's image
-                if deployment.spec and deployment.spec.template and deployment.spec.template.spec:
-                   deployment.spec.template.spec.containers[0].image = container_image
-                   await asyncio.to_thread(
-                       apps_v1.patch_namespaced_deployment,
-                       name=deployment_name, namespace=namespace, body=deployment
-                   )
-                   return f"Updated image to {container_image} for deployment {deployment_name} in {namespace}"
-                return "Failed to find container to update"
-            else:
-                return f"Unsupported action: {action}"
-        except Exception as e:
-            logger.error(f"Failed to apply fix: {e}")
-            span.record_exception(e)
-            return f"Failed to apply fix: {str(e)}"
+                containers = (
+                    deployment.spec.template.spec.containers
+                    if deployment.spec
+                    and deployment.spec.template
+                    and deployment.spec.template.spec
+                    else None
+                )
+                if not containers:
+                    return "Failed to locate containers in deployment spec"
+
+                containers[0].image = container_image
+                await asyncio.to_thread(
+                    apps_v1.patch_namespaced_deployment,
+                    name=deployment_name,
+                    namespace=namespace,
+                    body=deployment,
+                )
+                return (
+                    f"Updated image to {container_image} for deployment "
+                    f"{deployment_name} in {namespace}"
+                )
+
+            return f"Unsupported action: {action}. Use 'restart' or 'update_image'."
+        except Exception as exc:
+            logger.error("Failed to apply fix: %s", exc)
+            span.record_exception(exc)
+            return f"Failed to apply fix: {exc}"
+
 
 @mcp.tool()
-async def diagnose_cluster_health(ctx: Context, manual_testing: bool = False) -> str:
+async def diagnose_cluster_health(
+    ctx: Context, manual_testing: bool = False
+) -> str:
     """
-    Autonomous Error Recovery Tool:
-    Monitors for CrashLoopBackOff and uses sampling to request fixes from the LLM.
-    The LLM is expected to run this tool periodically.
-    Set manual_testing to True when using the Inspector to bypass the LLM loop.
+    Scan the target namespace for unhealthy pods and optionally request an LLM fix.
+
+    When manual_testing is True the LLM sampling step is skipped so the tool
+    can be exercised from the MCP Inspector without timing out.
     """
     with tracer.start_as_current_span("diagnose_cluster_health") as span:
         logger.info("Running cluster health diagnostic")
-        issues_found = []
+        issues_found: List[str] = []
 
         try:
-            target_namespace = os.getenv("POD_NAMESPACE", "default")
+            target_namespace: str = os.getenv("POD_NAMESPACE", "default")
             pods = await asyncio.to_thread(
-                v1.list_namespaced_pod,
-                namespace=target_namespace
+                v1.list_namespaced_pod, namespace=target_namespace
             )
             for pod in pods.items:
-                if pod.status and pod.status.container_statuses:
-                    for status in pod.status.container_statuses:
-                        if status.state and status.state.waiting and status.state.waiting.reason in ["CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull"]:
-                            namespace = pod.metadata.namespace
-                            pod_name = pod.metadata.name
-                            issue = f"{namespace}/{pod_name}"
-                            issues_found.append(issue)
-                            logger.info(f"Detected CrashLoopBackOff in {issue}")
+                if not (pod.status and pod.status.container_statuses):
+                    continue
+                for status in pod.status.container_statuses:
+                    if not (status.state and status.state.waiting):
+                        continue
+                    if status.state.waiting.reason not in UNHEALTHY_REASONS:
+                        continue
 
-                            # Rate limit sampling requests
-                            if not sampling_limiter.allow():
-                                logger.warning("Rate limit reached for sampling requests")
-                                continue
+                    ns: str = pod.metadata.namespace
+                    pod_name: str = pod.metadata.name
+                    issue: str = f"{ns}/{pod_name}"
+                    issues_found.append(issue)
+                    logger.info("Detected %s in %s", status.state.waiting.reason, issue)
 
-                            # Fetch summarized logs via resource (simulated local call)
-                            summary = await summarize_pod_logs(namespace, pod_name)
-                            
-                            if manual_testing:
-                                logger.info(f"Manual mode: Skipping LLM sampling for {issue}")
-                                continue
+                    if not sampling_limiter.allow():
+                        logger.warning("Rate limit reached for sampling requests")
+                        continue
 
-                            # Request diagnostic fix via sampling
-                            try:
-                                if ctx.session:
-                                    # Create message request
-                                    msg = SamplingMessage(
-                                        role="user",
-                                        content=TextContent(
-                                            type="text",
-                                            text=f"Pod {pod_name} in namespace {namespace} is in CrashLoopBackOff. Log summary: {summary}. Suggest a fix using the apply_k8s_fix tool.",
-                                        )
-                                    )
-                                    # Send request back to the client/LLM
-                                    response = await ctx.session.create_message(
-                                        messages=[msg],
-                                        max_tokens=1000
-                                    )
-                                    logger.info(f"Received sampling response for {issue}: {response}")
+                    summary: str = await summarize_pod_logs(ns, pod_name)
 
-                                    # Process LLM response to apply fix if requested
-                                    # Based on MCP types, content might be a CallToolMessage
-                                    if hasattr(response, "content") and isinstance(response.content, dict):
-                                        pass
-                                    elif hasattr(response, "content"):
-                                        content_list = response.content if isinstance(response.content, list) else [response.content]
-                                        for content_item in content_list:
-                                            if getattr(content_item, "type", "") == "callTool":
-                                                if getattr(content_item, "name", "") == "apply_k8s_fix":
-                                                    args = getattr(content_item, "arguments", {})
-                                                    if isinstance(args, dict):
-                                                        fix_result = await apply_k8s_fix(**args)
-                                                        logger.info(f"Applied fix automatically: {fix_result}")
-                            except Exception as e:
-                                logger.error(f"Failed to sample for fix: {e}")
+                    if manual_testing:
+                        logger.info("Manual mode: skipping LLM sampling for %s", issue)
+                        continue
 
-        except Exception as e:
-            logger.error(f"Error checking cluster health: {e}")
-            span.record_exception(e)
-            return f"Error checking cluster health: {str(e)}"
+                    try:
+                        if ctx.session:
+                            msg: SamplingMessage = SamplingMessage(
+                                role="user",
+                                content=TextContent(
+                                    type="text",
+                                    text=(
+                                        f"Pod {pod_name} in namespace {ns} is "
+                                        f"unhealthy. Log summary: {summary}. "
+                                        f"Suggest a fix using apply_k8s_fix."
+                                    ),
+                                ),
+                            )
+                            response = await ctx.session.create_message(
+                                messages=[msg], max_tokens=1000
+                            )
+                            logger.info(
+                                "Sampling response for %s: %s", issue, response
+                            )
+                    except Exception as exc:
+                        logger.error("Failed to sample for fix: %s", exc)
+
+        except Exception as exc:
+            logger.error("Error checking cluster health: %s", exc)
+            span.record_exception(exc)
+            return f"Error checking cluster health: {exc}"
 
         if not issues_found:
-            return "Cluster is healthy. No CrashLoopBackOff pods found."
+            return "Cluster is healthy. No unhealthy pods found."
 
         return f"Diagnostic complete. Found issues in: {', '.join(issues_found)}"
 
-# Tool to read logs from restricted roots
+
 @mcp.tool()
 def read_sentinel_log(filepath: str) -> str:
-    """Read logs securely from the restricted sentinel log directory"""
+    """
+    Read a log file from the restricted sentinel log directory.
+
+    The directory is configured via the SENTINEL_LOG_DIR environment variable
+    (default: ./sentinel_logs). Path traversal outside this directory is denied.
+    """
     with tracer.start_as_current_span("read_sentinel_log") as span:
         span.set_attribute("filepath", filepath)
-        
-        # Use a local cross-platform path for testing, or rely on ENV variable
-        log_dir = os.getenv("SENTINEL_LOG_DIR", "./sentinel_logs")
-        base_dir = Path(log_dir).resolve()
-        
-        # Ensure the directory actually exists for local testing
-        base_dir.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            requested_path = Path(filepath).resolve()
-        except Exception as e:
-            span.record_exception(e)
-            return f"Error resolving path: {e}"
 
-        # Roots validation check
+        log_dir: str = os.getenv("SENTINEL_LOG_DIR", "./sentinel_logs")
+        base_dir: Path = Path(log_dir).resolve()
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            requested_path: Path = Path(filepath).resolve()
+        except Exception as exc:
+            span.record_exception(exc)
+            return f"Error resolving path: {exc}"
+
         try:
             requested_path.relative_to(base_dir)
-        except ValueError as e:
-            span.record_exception(e)
-            return f"Access denied: Can only read from {base_dir}"
+        except ValueError as exc:
+            span.record_exception(exc)
+            return f"Access denied: path must be inside {base_dir}"
 
         if not requested_path.exists():
             return f"File not found: {requested_path}"
@@ -268,23 +314,18 @@ def read_sentinel_log(filepath: str) -> str:
             return f"Path is not a file: {requested_path}"
 
         try:
-            with open(requested_path, 'r') as f:
-                return f.read()
-        except Exception as e:
-            span.record_exception(e)
-            return f"Error reading file: {e}"
+            return requested_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            span.record_exception(exc)
+            return f"Error reading file: {exc}"
+
 
 if __name__ == "__main__":
-    # Note: For production authenticated SSE, you should proxy requests through an API Gateway,
-    # or mount the FastMCP server in a custom FastAPI/Starlette application with auth middleware.
-    # We are using the standard FastMCP runner here to avoid `sse_app()` method compatibility issues
-    # reported by some MCP evaluation environments.
     from mcp.server.transport_security import TransportSecuritySettings
+
     mcp.settings.host = "0.0.0.0"
     mcp.settings.port = 8000
-    # Disable DNS rebinding protection for local dev (allows Docker inspector to connect)
     mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=False
     )
     mcp.run(transport="sse")
-

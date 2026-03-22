@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .env
+.venv/
+sentinel_logs/
+logs/
+mcp_kubernetes_tutorial.md

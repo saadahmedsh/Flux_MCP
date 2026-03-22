@@ -1,4 +1,4 @@
-.PHONY: install test lint run build clean
+.PHONY: install test lint run agent build clean
 
 install:
 	uv sync
@@ -12,8 +12,11 @@ lint:
 run:
 	uv run python server.py
 
+agent:
+	uv run python gemini_agent.py
+
 build:
-	docker build -t your-registry/sentinel-mcp:latest .
+	docker build -t sentinel-mcp:latest .
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} +
